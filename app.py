@@ -179,7 +179,16 @@ async def analyze_swing(video: UploadFile = File(...)):
         # フレーム数とFPSを取得
         fps = cap.get(cv2.CAP_PROP_FPS)
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        print(f"[INFO] 動画情報: FPS={fps}, フレーム数={frame_count}")
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        print(f"[INFO] 動画情報: FPS={fps}, フレーム数={frame_count}, 解像度={width}x{height}")
+        
+        # メモリ節約のため、高解像度の場合はリサイズ
+        max_dimension = 1280  # HD解像度に制限
+        scale_factor = 1.0
+        if width > max_dimension or height > max_dimension:
+            scale_factor = max_dimension / max(width, height)
+            print(f"[INFO] メモリ節約のためリサイズ: {scale_factor:.2f}x")
         
         # フレームスキップ設定（処理速度向上のため）
         frame_skip = max(1, int(fps / 10))
@@ -201,6 +210,10 @@ async def analyze_swing(video: UploadFile = File(...)):
             if frame_idx % frame_skip != 0:
                 frame_idx += 1
                 continue
+            
+            # メモリ節約のためリサイズ
+            if scale_factor < 1.0:
+                frame = cv2.resize(frame, None, fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_AREA)
             
             # ボール検出（簡易版 - 色ベース）
             ball_pos = detect_ball_simple(frame)
