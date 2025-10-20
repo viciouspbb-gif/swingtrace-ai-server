@@ -151,12 +151,24 @@ async def analyze_swing(video: UploadFile = File(...)):
     Returns:
         AnalysisResult: 分析結果
     """
+    tmp_path = None
     try:
+        print(f"[INFO] 動画アップロード開始: {video.filename}")
+        
+        # ファイルサイズチェック（100MB制限）
+        content = await video.read()
+        file_size_mb = len(content) / (1024 * 1024)
+        print(f"[INFO] ファイルサイズ: {file_size_mb:.2f}MB")
+        
+        if file_size_mb > 100:
+            raise HTTPException(status_code=413, detail="ファイルサイズが大きすぎます（最大100MB）")
+        
         # 一時ファイルに保存
         with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_file:
-            content = await video.read()
             tmp_file.write(content)
             tmp_path = tmp_file.name
+        
+        print(f"[INFO] 一時ファイル保存完了: {tmp_path}")
         
         # 動画を読み込み
         cap = cv2.VideoCapture(tmp_path)
@@ -167,16 +179,28 @@ async def analyze_swing(video: UploadFile = File(...)):
         # フレーム数とFPSを取得
         fps = cap.get(cv2.CAP_PROP_FPS)
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        print(f"[INFO] 動画情報: FPS={fps}, フレーム数={frame_count}")
         
-        # ボール検出とトラッキング（簡易版）
+        # フレームスキップ設定（処理速度向上のため）
+        frame_skip = max(1, int(fps / 10))
+        print(f"[INFO] フレームスキップ: {frame_skip}フレームごとに処理")
+        
+        # ボール検出とトラッキング（最適化版）
         trajectory_points = []
         ball_detected = False
         
         frame_idx = 0
+        processed_frames = 0
+        
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
+            
+            # フレームスキップ
+            if frame_idx % frame_skip != 0:
+                frame_idx += 1
+                continue
             
             # ボール検出（簡易版 - 色ベース）
             ball_pos = detect_ball_simple(frame)
@@ -194,9 +218,19 @@ async def analyze_swing(video: UploadFile = File(...)):
                 )
             
             frame_idx += 1
+            processed_frames += 1
+            
+            # 進捗ログ（100フレームごと）
+            if processed_frames % 100 == 0:
+                print(f"[INFO] 処理中: {processed_frames}フレーム処理完了")
         
         cap.release()
-        os.unlink(tmp_path)
+        print(f"[INFO] 動画処理完了: 全{frame_idx}フレーム中{processed_frames}フレーム処理")
+        
+        # 一時ファイル削除
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+            print(f"[INFO] 一時ファイル削除完了")
         
         # 弾道計算
         if len(trajectory_points) >= 2:
@@ -208,6 +242,8 @@ async def analyze_swing(video: UploadFile = File(...)):
             max_height = 0.0
             flight_time = 0.0
         
+        print(f"[INFO] 分析結果: ボール検出={ball_detected}, 軌跡点数={len(trajectory_points)}")
+        
         return AnalysisResult(
             ball_detected=ball_detected,
             trajectory=trajectory_points,
@@ -218,7 +254,14 @@ async def analyze_swing(video: UploadFile = File(...)):
             confidence=0.85 if ball_detected else 0.0
         )
         
+    except HTTPException:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
     except Exception as e:
+        print(f"[ERROR] 分析エラー: {str(e)}")
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
         raise HTTPException(status_code=500, detail=f"分析エラー: {str(e)}")
 
 @app.post("/api/ai-coaching", response_model=AICoachingResponse)
@@ -401,4 +444,10 @@ def calculate_swing_score(request: AICoachingRequest) -> int:
     return min(100, max(0, score))
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=8000,
+        timeout_keep_alive=120,
+        limit_max_requests=1000
+    )
