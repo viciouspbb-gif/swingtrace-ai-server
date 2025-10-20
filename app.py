@@ -70,6 +70,7 @@ class AICoachingResponse(BaseModel):
     score: int
 
 @app.get("/")
+@app.head("/")
 async def root():
     """ヘルスチェック"""
     return {
