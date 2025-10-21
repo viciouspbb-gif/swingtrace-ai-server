@@ -111,11 +111,15 @@ class User(BaseModel):
 # 認証ヘルパー関数
 def hash_password(password: str) -> str:
     """パスワードをハッシュ化"""
-    return pwd_context.hash(password)
+    # bcryptは72バイト制限があるため、長いパスワードは切り詰める
+    password_bytes = password.encode('utf-8')[:72]
+    return pwd_context.hash(password_bytes)
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """パスワードを検証"""
-    return pwd_context.verify(plain_password, hashed_password)
+    # bcryptは72バイト制限があるため、長いパスワードは切り詰める
+    password_bytes = plain_password.encode('utf-8')[:72]
+    return pwd_context.verify(password_bytes, hashed_password)
 
 def create_access_token(data: dict) -> str:
     """JWTアクセストークンを生成"""
