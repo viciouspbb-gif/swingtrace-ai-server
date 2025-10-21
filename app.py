@@ -3,9 +3,10 @@ SwingTrace AI Coaching Server
 FastAPI-based server for golf swing analysis
 """
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, EmailStr
 import uvicorn
 import cv2
 import numpy as np
@@ -13,6 +14,9 @@ from typing import List, Dict, Optional
 import tempfile
 import os
 import sys
+import jwt
+from datetime import datetime, timedelta
+from passlib.context import CryptContext
 sys.path.append(os.path.dirname(__file__))
 from models.subscription import (
     subscription_manager, 
@@ -22,6 +26,18 @@ from models.subscription import (
 )
 
 app = FastAPI(title="SwingTrace AI Server", version="1.0.0")
+
+# JWT設定
+SECRET_KEY = "your-secret-key-change-in-production-12345"  # 本番環境では環境変数から取得
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7日間
+
+# パスワードハッシュ化
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+security = HTTPBearer()
+
+# ユーザーデータベース（本番環境ではデータベースを使用）
+users_db: Dict[str, dict] = {}
 
 # CORS設定（Androidアプリからのアクセスを許可）
 app.add_middleware(
@@ -69,6 +85,77 @@ class AICoachingResponse(BaseModel):
     strengths: List[str]
     score: int
 
+# 認証用データモデル
+class UserRegister(BaseModel):
+    email: EmailStr
+    password: str
+    name: str
+
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+    user_id: str
+    email: str
+    name: str
+
+class User(BaseModel):
+    user_id: str
+    email: str
+    name: str
+    created_at: str
+
+# 認証ヘルパー関数
+def hash_password(password: str) -> str:
+    """パスワードをハッシュ化"""
+    return pwd_context.hash(password)
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """パスワードを検証"""
+    return pwd_context.verify(plain_password, hashed_password)
+
+def create_access_token(data: dict) -> str:
+    """JWTアクセストークンを生成"""
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def verify_token(token: str) -> Optional[dict]:
+    """トークンを検証"""
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.JWTError:
+        return None
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
+    """現在のユーザーを取得（認証必須）"""
+    token = credentials.credentials
+    payload = verify_token(token)
+    
+    if payload is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="無効なトークンまたは期限切れです",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    user_id = payload.get("user_id")
+    if user_id not in users_db:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="ユーザーが見つかりません"
+        )
+    
+    return users_db[user_id]
+
 @app.get("/")
 @app.head("/")
 async def root():
@@ -78,6 +165,106 @@ async def root():
         "message": "SwingTrace AI Server is running",
         "version": "1.0.0"
     }
+
+@app.post("/api/auth/register", response_model=Token)
+async def register(user_data: UserRegister):
+    """新規ユーザー登録"""
+    # メールアドレスの重複チェック
+    for user in users_db.values():
+        if user["email"] == user_data.email:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="このメールアドレスはすでに登録されています"
+            )
+    
+    # ユーザーIDを生成（メールアドレスをベースに）
+    user_id = f"user_{len(users_db) + 1}_{user_data.email.split('@')[0]}"
+    
+    # パスワードをハッシュ化
+    hashed_password = hash_password(user_data.password)
+    
+    # ユーザーをデータベースに追加
+    users_db[user_id] = {
+        "user_id": user_id,
+        "email": user_data.email,
+        "name": user_data.name,
+        "hashed_password": hashed_password,
+        "created_at": datetime.utcnow().isoformat()
+    }
+    
+    # JWTトークンを生成
+    access_token = create_access_token({
+        "user_id": user_id,
+        "email": user_data.email
+    })
+    
+    print(f"[INFO] 新規ユーザー登録: {user_data.email} (ID: {user_id})")
+    
+    return Token(
+        access_token=access_token,
+        token_type="bearer",
+        user_id=user_id,
+        email=user_data.email,
+        name=user_data.name
+    )
+
+@app.post("/api/auth/login", response_model=Token)
+async def login(credentials: UserLogin):
+    """ログイン"""
+    # ユーザーを検索
+    user = None
+    for u in users_db.values():
+        if u["email"] == credentials.email:
+            user = u
+            break
+    
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="メールアドレスまたはパスワードが間違っています"
+        )
+    
+    # パスワードを検証
+    if not verify_password(credentials.password, user["hashed_password"]):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="メールアドレスまたはパスワードが間違っています"
+        )
+    
+    # JWTトークンを生成
+    access_token = create_access_token({
+        "user_id": user["user_id"],
+        "email": user["email"]
+    })
+    
+    print(f"[INFO] ログイン: {user['email']}")
+    
+    return Token(
+        access_token=access_token,
+        token_type="bearer",
+        user_id=user["user_id"],
+        email=user["email"],
+        name=user["name"]
+    )
+
+@app.post("/api/auth/logout")
+async def logout(current_user: dict = Depends(get_current_user)):
+    """ログアウト（トークンはクライアント側で削除）"""
+    print(f"[INFO] ログアウト: {current_user['email']}")
+    return {
+        "success": True,
+        "message": "ログアウトしました"
+    }
+
+@app.get("/api/auth/me", response_model=User)
+async def get_me(current_user: dict = Depends(get_current_user)):
+    """現在のユーザー情報を取得"""
+    return User(
+        user_id=current_user["user_id"],
+        email=current_user["email"],
+        name=current_user["name"],
+        created_at=current_user["created_at"]
+    )
 
 @app.get("/api/plans")
 async def get_plans():
@@ -278,18 +465,22 @@ async def analyze_swing(video: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"分析エラー: {str(e)}")
 
 @app.post("/api/ai-coaching", response_model=AICoachingResponse)
-async def ai_coaching(request: AICoachingRequest):
+async def ai_coaching(request: AICoachingRequest, current_user: dict = Depends(get_current_user)):
     """
-    AIコーチングアドバイスを提供
+    AIコーチングアドバイスを提供（認証必須）
     
     Args:
         request: スイングデータ
+        current_user: 現在のユーザー（認証トークンから取得）
         
     Returns:
         AICoachingResponse: AIアドバイス
     """
+    # トークンからuser_idを取得
+    user_id = current_user["user_id"]
+    
     # 使用回数チェック
-    can_use, message = subscription_manager.check_and_increment(request.user_id)
+    can_use, message = subscription_manager.check_and_increment(user_id)
     
     if not can_use:
         raise HTTPException(
@@ -302,7 +493,7 @@ async def ai_coaching(request: AICoachingRequest):
         )
     
     # ユーザーのプラン取得
-    subscription = subscription_manager.get_subscription(request.user_id)
+    subscription = subscription_manager.get_subscription(user_id)
     
     # プランに応じたアドバイス生成
     if subscription.plan_type == PlanType.FREE or subscription.plan_type == PlanType.BASIC:
